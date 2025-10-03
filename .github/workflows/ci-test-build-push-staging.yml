@@ -1,0 +1,95 @@
+name: CI → Test, Build, Push, Staging
+
+on:
+  push:
+    branches: [ "testing" ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [ "customer_service", "product_service", "order_service" ]
+    defaults:
+      run:
+        working-directory: backend/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Docker Login
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Build & Push Services
+        run: |
+          for svc in customer_service product_service order_service; do
+            docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/$svc:${GITHUB_SHA} backend/$svc
+            docker push ${{ secrets.ACR_LOGIN_SERVER }}/$svc:${GITHUB_SHA}
+          done
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/frontend:${GITHUB_SHA} frontend
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/frontend:${GITHUB_SHA}
+
+  staging:
+    name: Deploy Temporary Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Create Staging ACI
+        run: |
+          az container create \
+            --resource-group ${{ secrets.AZURE_RG }} \
+            --name sit722-staging-${{ github.run_id }} \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/customer_service:${GITHUB_SHA} \
+            --cpu 1 --memory 1 \
+            --registry-login-server ${{ secrets.ACR_LOGIN_SERVER }} \
+            --registry-username ${{ secrets.ACR_USERNAME }} \
+            --registry-password ${{ secrets.ACR_PASSWORD }} \
+            --ports 8000 \
+            --dns-name-label sit722-staging-${{ github.run_id }} \
+            --location ${{ secrets.AZURE_LOCATION }}
+
+      - name: Health Check
+        run: |
+          FQDN=$(az container show \
+            --resource-group ${{ secrets.AZURE_RG }} \
+            --name sit722-staging-${{ github.run_id }} \
+            --query ipAddress.fqdn -o tsv)
+          echo "Testing http://$FQDN:8000/health"
+          for i in {1..20}; do
+            curl -fsS http://$FQDN:8000/health && break
+            sleep 5
+          done
+
+      - name: Destroy Staging
+        if: always()
+        run: |
+          az container delete \
+            --resource-group ${{ secrets.AZURE_RG }} \
+            --name sit722-staging-${{ github.run_id }} --yes
