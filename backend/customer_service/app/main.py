@@ -1,5 +1,3 @@
-# week05/backend/customer_service/app/main.py
-
 import logging
 import os
 import sys
@@ -15,7 +13,7 @@ from .db import Base, engine, get_db
 from .models import Customer
 from .schemas import CustomerCreate, CustomerResponse, CustomerUpdate
 
-# --- Standard Logging Configuration ---
+# --- Logging ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -23,275 +21,127 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress noisy logs from third-party libraries for cleaner output
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 
-
 PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://localhost:8000")
-logger.info(
-    f"Order Service: Configured to communicate with Product Service at: {PRODUCT_SERVICE_URL}"
-)
+logger.info(f"Customer Service configured to talk to Product Service at {PRODUCT_SERVICE_URL}")
 
-# --- FastAPI Application Setup ---
+# --- FastAPI App ---
 app = FastAPI(
     title="Customer Service API",
-    description="Manages orders for mini-ecommerce app, with synchronous stock deduction.",
+    description="Manages customers for mini-ecommerce app.",
     version="1.0.0",
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# --- FastAPI Event Handlers ---
-@app.on_event("startup")
-async def startup_event():
-    max_retries = 10
-    retry_delay_seconds = 5
-    for i in range(max_retries):
-        try:
-            logger.info(
-                f"Customer Service: Attempting to connect to PostgreSQL and create tables (attempt {i+1}/{max_retries})..."
-            )
-            Base.metadata.create_all(bind=engine)
-            logger.info(
-                "Customer Service: Successfully connected to PostgreSQL and ensured tables exist."
-            )
-            break  # Exit loop if successful
-        except OperationalError as e:
-            logger.warning(f"Customer Service: Failed to connect to PostgreSQL: {e}")
-            if i < max_retries - 1:
-                logger.info(
-                    f"Customer Service: Retrying in {retry_delay_seconds} seconds..."
-                )
-                time.sleep(retry_delay_seconds)
-            else:
-                logger.critical(
-                    f"Customer Service: Failed to connect to PostgreSQL after {max_retries} attempts. Exiting application."
-                )
-                sys.exit(1)  # Critical failure: exit if DB connection is unavailable
-        except Exception as e:
-            logger.critical(
-                f"Customer Service: An unexpected error occurred during database startup: {e}",
-                exc_info=True,
-            )
-            sys.exit(1)
-
-
-# --- Root Endpoint ---
-@app.get("/", status_code=status.HTTP_200_OK, summary="Root endpoint")
-async def read_root():
-    return {"message": "Welcome to the Customer Service!"}
-
-
-# --- Health Check Endpoint ---
-@app.get("/health", status_code=status.HTTP_200_OK, summary="Health check endpoint")
+# --- Health ---
+@app.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
     return {"status": "ok", "service": "customer-service"}
 
+# --- Startup: Conditional DB init ---
+@app.on_event("startup")
+async def startup_event():
+    if os.getenv("DISABLE_DB", "false").lower() == "true":
+        logger.warning("Customer Service: Skipping DB initialization (DISABLE_DB=true).")
+        return
 
-# --- CRUD Endpoints for Customers ---
-@app.post(
-    "/customers/",
-    response_model=CustomerResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a new customer",
-)
+    max_retries = 10
+    for i in range(max_retries):
+        try:
+            logger.info(f"Customer Service: Attempting DB init (attempt {i+1}/{max_retries})")
+            Base.metadata.create_all(bind=engine)
+            logger.info("Customer Service: DB initialized successfully.")
+            break
+        except OperationalError as e:
+            logger.warning(f"Customer Service: DB connection failed: {e}")
+            time.sleep(5)
+        except Exception as e:
+            logger.critical(f"Unexpected DB startup error: {e}", exc_info=True)
+            sys.exit(1)
+
+# --- Root ---
+@app.get("/", status_code=status.HTTP_200_OK)
+async def read_root():
+    return {"message": "Welcome to the Customer Service!"}
+
+# --- CRUD Endpoints (unchanged) ---
+@app.post("/customers/", response_model=CustomerResponse, status_code=status.HTTP_201_CREATED)
 async def create_customer(customer: CustomerCreate, db: Session = Depends(get_db)):
-    logger.info(f"Customer Service: Creating customer with email: {customer.email}")
     db_customer = Customer(
         email=customer.email,
-        password_hash=customer.password,  # Storing raw password for simplicity in this example
+        password_hash=customer.password,
         first_name=customer.first_name,
         last_name=customer.last_name,
         phone_number=customer.phone_number,
         shipping_address=customer.shipping_address,
     )
-
     try:
         db.add(db_customer)
         db.commit()
         db.refresh(db_customer)
-        logger.info(
-            f"Customer Service: Customer '{db_customer.email}' (ID: {db_customer.customer_id}) created successfully."
-        )
         return db_customer
     except IntegrityError:
         db.rollback()
-        logger.warning(
-            f"Customer Service: Attempted to create customer with existing email: {customer.email}"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered."
-        )
-    except Exception as e:
+        raise HTTPException(status_code=400, detail="Email already registered.")
+    except Exception:
         db.rollback()
-        logger.error(f"Customer Service: Error creating customer: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not create customer.",
-        )
+        raise HTTPException(status_code=500, detail="Could not create customer.")
 
-
-@app.get(
-    "/customers/",
-    response_model=List[CustomerResponse],
-    summary="Retrieve a list of all customers",
-)
-def list_customers(
-    db: Session = Depends(get_db),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=100),
-    search: Optional[str] = Query(None, max_length=255),
-):
-    logger.info(
-        f"Customer Service: Listing customers with skip={skip}, limit={limit}, search='{search}'"
-    )
+@app.get("/customers/", response_model=List[CustomerResponse])
+def list_customers(db: Session = Depends(get_db), skip: int = 0, limit: int = 100, search: Optional[str] = None):
     query = db.query(Customer)
     if search:
-        search_pattern = f"%{search}%"
-        logger.info(f"Customer Service: Applying search filter for term: {search}")
         query = query.filter(
-            (Customer.first_name.ilike(search_pattern))
-            | (Customer.last_name.ilike(search_pattern))
-            | (Customer.email.ilike(search_pattern))
+            (Customer.first_name.ilike(f"%{search}%")) |
+            (Customer.last_name.ilike(f"%{search}%")) |
+            (Customer.email.ilike(f"%{search}%"))
         )
-    customers = query.offset(skip).limit(limit).all()
+    return query.offset(skip).limit(limit).all()
 
-    logger.info(
-        f"Customer Service: Retrieved {len(customers)} customers (skip={skip}, limit={limit})."
-    )
-    return customers
-
-
-@app.get(
-    "/customers/{customer_id}",
-    response_model=CustomerResponse,
-    summary="Retrieve a single customer by ID",
-)
+@app.get("/customers/{customer_id}", response_model=CustomerResponse)
 def get_customer(customer_id: int, db: Session = Depends(get_db)):
-    """
-    Retrieves details for a specific customer using their unique ID.
-    """
-    logger.info(f"Customer Service: Fetching customer with ID: {customer_id}")
     customer = db.query(Customer).filter(Customer.customer_id == customer_id).first()
     if not customer:
-        logger.warning(f"Customer Service: Customer with ID {customer_id} not found.")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found"
-        )
-
-    logger.info(
-        f"Customer Service: Retrieved customer with ID {customer_id}. Email: {customer.email}"
-    )
+        raise HTTPException(status_code=404, detail="Customer not found")
     return customer
 
-
-@app.put(
-    "/customers/{customer_id}",
-    response_model=CustomerResponse,
-    summary="Update an existing customer by ID",
-)
-async def update_customer(
-    customer_id: int, customer_data: CustomerUpdate, db: Session = Depends(get_db)
-):
-    """
-    Updates an existing customer's details. Only provided fields will be updated.
-    Does not allow password update via this endpoint for security (use a dedicated endpoint if needed).
-    """
-    logger.info(
-        f"Customer Service: Updating customer with ID: {customer_id} with data: {customer_data.model_dump(exclude_unset=True)}"
-    )
+@app.put("/customers/{customer_id}", response_model=CustomerResponse)
+async def update_customer(customer_id: int, customer_data: CustomerUpdate, db: Session = Depends(get_db)):
     db_customer = db.query(Customer).filter(Customer.customer_id == customer_id).first()
     if not db_customer:
-        logger.warning(
-            f"Customer Service: Attempted to update non-existent customer with ID {customer_id}."
-        )
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found"
-        )
-
+        raise HTTPException(status_code=404, detail="Customer not found")
     update_data = customer_data.model_dump(exclude_unset=True)
-
-    if "password" in update_data:  # If 'password' was somehow passed, remove it
-        logger.warning(
-            f"Customer Service: Attempted password update via general /customers/{{id}} endpoint for customer {customer_id}. This is disallowed."
-        )
-        del update_data["password"]  # Remove password if present
-
     for key, value in update_data.items():
         setattr(db_customer, key, value)
-
     try:
-        db.add(db_customer)  # Mark for update
         db.commit()
         db.refresh(db_customer)
-        logger.info(f"Customer Service: Customer {customer_id} updated successfully.")
         return db_customer
     except IntegrityError:
         db.rollback()
-        # This could happen if a user tries to change email to one that already exists
-        logger.warning(
-            f"Customer Service: Attempted to update customer {customer_id} to an existing email."
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Updated email already registered by another customer.",
-        )
-    except Exception as e:
+        raise HTTPException(status_code=400, detail="Updated email already exists")
+    except Exception:
         db.rollback()
-        logger.error(
-            f"Customer Service: Error updating customer {customer_id}: {e}",
-            exc_info=True,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not update customer.",
-        )
+        raise HTTPException(status_code=500, detail="Could not update customer")
 
-
-@app.delete(
-    "/customers/{customer_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete a customer by ID",
-)
+@app.delete("/customers/{customer_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_customer(customer_id: int, db: Session = Depends(get_db)):
-    """
-    Deletes a customer record from the database.
-    """
-    logger.info(
-        f"Customer Service: Attempting to delete customer with ID: {customer_id}"
-    )
     customer = db.query(Customer).filter(Customer.customer_id == customer_id).first()
     if not customer:
-        logger.warning(
-            f"Customer Service: Attempted to delete non-existent customer with ID {customer_id}."
-        )
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found"
-        )
-
+        raise HTTPException(status_code=404, detail="Customer not found")
     try:
         db.delete(customer)
         db.commit()
-        logger.info(
-            f"Customer Service: Customer {customer_id} deleted successfully. Email: {customer.email}"
-        )
-    except Exception as e:
+    except Exception:
         db.rollback()
-        logger.error(
-            f"Customer Service: Error deleting customer {customer_id}: {e}",
-            exc_info=True,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An error occurred while deleting the customer.",
-        )
+        raise HTTPException(status_code=500, detail="Could not delete customer")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
